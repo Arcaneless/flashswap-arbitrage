@@ -1,0 +1,3 @@
+export const WAVAX = "0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7";
+export const JOE = "0x6e84a6216eA6dACC71eE8E6b0a5B7322EEbC0fDd";
+export const PTP = "0x22d4002028f537599be9f666d1c4fa138522f9c8";
