@@ -11,35 +11,28 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {IJoeRouter02} from "@traderjoe-xyz/core/contracts/traderjoe/interfaces/IJoeRouter02.sol";
-import {JoeLibrary} from "./libraries/JoeLibrary.sol";
 
 import {IPangolinRouter} from "@pangolindex/exchange-contracts/contracts/pangolin-periphery/interfaces/IPangolinRouter.sol";
-import {PangolinLibrary} from "./libraries/PangolinLibrary.sol";
 
 import {GenericLibrary} from "./libraries/GenericLibrary.sol";
 
 contract FlashSwap is FlashLoanSimpleReceiverBase, Ownable {
-    IJoeRouter02 private joeRouter;
-    IPangolinRouter private pangolinRouter;
-
-    address private immutable joeFactory;
-    address private immutable pangolinFactory;
-
     uint256 private constant deadline = 30000 days;
     address public immutable WAVAX;
 
-    constructor(
-        IPoolAddressesProvider _provider,
-        IJoeRouter02 _joeRouter,
-        address _joeFactory,
-        IPangolinRouter _pangolinRouter,
-        address _pangolinFactory,
-        address _WAVAX
-    ) FlashLoanSimpleReceiverBase(_provider) {
-        joeRouter = _joeRouter;
-        joeFactory = _joeFactory;
-        pangolinRouter = _pangolinRouter;
-        pangolinFactory = _pangolinFactory;
+    struct DEX {
+        string name;
+        address router;
+        address factory;
+        bytes secret;
+    }
+
+    // router => DEX
+    mapping(address => DEX) private dexes;
+
+    constructor(IPoolAddressesProvider _provider, address _WAVAX)
+        FlashLoanSimpleReceiverBase(_provider)
+    {
         WAVAX = _WAVAX;
     }
 
@@ -47,59 +40,97 @@ contract FlashSwap is FlashLoanSimpleReceiverBase, Ownable {
         console.log("added reserve", msg.value);
     }
 
-    function quotePrice(address tokenAddress)
-        internal
-        view
-        returns (uint256 joeQuote, uint256 pngQuote)
-    {
-        // the path 1
+    function addDex(
+        string memory _name,
+        address _router,
+        address _factory,
+        bytes memory _secret
+    ) external {
+        dexes[_router] = DEX(_name, _router, _factory, _secret);
+    }
+
+    // find the maximum path to perform arbitrage
+    function quotePrice(
+        address _tokenAddress,
+        address _dex1,
+        address _dex2
+    ) internal view returns (address fromDex, address toDex) {
+        // the quotation path
         address[] memory path = new address[](2);
-        path[0] = tokenAddress;
+        path[0] = _tokenAddress;
         path[1] = WAVAX;
 
-        // amount out joe
-        joeQuote = JoeLibrary.getAmountsOut(joeFactory, 1 ether, path)[1];
-
-        // amount out ong
-        pngQuote = PangolinLibrary.getAmountsOut(
-            pangolinFactory,
+        uint256 quote1 = GenericLibrary.getAmountsOut(
+            dexes[_dex1].factory,
             1 ether,
-            path
+            path,
+            dexes[_dex1].secret
         )[1];
 
-        console.log("Joe Quote", joeQuote, "Png Quote", pngQuote);
+        uint256 quote2 = GenericLibrary.getAmountsOut(
+            dexes[_dex2].factory,
+            1 ether,
+            path,
+            dexes[_dex2].secret
+        )[1];
+
+        console.log("quote of", dexes[_dex1].name, "is", quote1);
+        console.log("quote of", dexes[_dex2].name, "is", quote2);
+        require(quote1 != quote2, "two quotes cannot equal");
+        if (quote1 < quote2) {
+            fromDex = _dex1;
+            toDex = _dex2;
+        }
+        if (quote1 > quote2) {
+            fromDex = _dex2;
+            toDex = _dex1;
+        }
     }
 
-    function joeToPng(address _token, uint256 _amount)
-        internal
-        returns (uint256)
-    {
+    function swapBetweenDex(
+        address _token,
+        uint256 _amount,
+        address _fromDex,
+        address _toDex
+    ) internal returns (uint256) {
         // the path 1
         address[] memory path1 = new address[](2);
         path1[0] = WAVAX;
         path1[1] = _token;
 
+        DEX memory fromDex = dexes[_fromDex];
+        DEX memory toDex = dexes[_toDex];
+
         // amount out
-        uint256 amountRequired1 = JoeLibrary.getAmountsOut(
-            joeFactory,
+        uint256 amountExpected1 = GenericLibrary.getAmountsOut(
+            fromDex.factory,
             _amount,
-            path1
+            path1,
+            fromDex.secret
         )[1];
 
-        IERC20(WAVAX).approve(address(joeRouter), _amount);
-        uint256 amountReceived1 = joeRouter.swapExactTokensForTokens(
-            _amount,
-            amountRequired1,
-            path1,
-            address(this),
-            deadline
-        )[1];
+        IERC20(WAVAX).approve(address(fromDex.router), _amount);
+
+        (bool fromSuccess, bytes memory fromResult) = fromDex.router.call(
+            abi.encodeWithSignature(
+                "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+                _amount,
+                amountExpected1,
+                path1,
+                address(this),
+                deadline
+            )
+        );
+
+        require(fromSuccess, "fromDex router call failed");
+
+        uint256 amountReceivedFrom = abi.decode(fromResult, (uint256[]))[1];
 
         console.log(
-            "amountExpect",
+            "amountExpected",
             "amountReceived1",
-            amountRequired1,
-            amountReceived1
+            amountExpected1,
+            amountReceivedFrom
         );
 
         address[] memory path2 = new address[](2);
@@ -107,87 +138,33 @@ contract FlashSwap is FlashLoanSimpleReceiverBase, Ownable {
         path2[1] = WAVAX;
 
         // amount out
-        uint256 amountRequired2 = PangolinLibrary.getAmountsOut(
-            pangolinFactory,
-            amountReceived1,
-            path2
+        uint256 amountExpected2 = GenericLibrary.getAmountsOut(
+            toDex.factory,
+            amountReceivedFrom,
+            path2,
+            toDex.secret
         )[1];
 
-        IERC20(_token).approve(address(pangolinRouter), amountReceived1);
-        uint256 terminalAmount = pangolinRouter.swapExactTokensForTokens(
-            amountReceived1,
-            amountRequired2,
-            path2,
-            address(this),
-            deadline
-        )[1];
+        IERC20(_token).approve(address(toDex.router), amountReceivedFrom);
+        (bool toSuccess, bytes memory toResult) = toDex.router.call(
+            abi.encodeWithSignature(
+                "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+                amountReceivedFrom,
+                amountExpected2,
+                path2,
+                address(this),
+                deadline
+            )
+        );
+
+        require(toSuccess, "toDex router call failed");
+
+        uint256 terminalAmount = abi.decode(toResult, (uint256[]))[1];
 
         console.log(
             "amountExpected",
             "amountReceived2",
-            amountRequired2,
-            terminalAmount
-        );
-
-        return terminalAmount;
-    }
-
-    function pngToJoe(address _token, uint256 _amount)
-        internal
-        returns (uint256)
-    {
-        // the path 1
-        address[] memory path1 = new address[](2);
-        path1[0] = WAVAX;
-        path1[1] = _token;
-
-        // amount out
-        uint256 amountRequired1 = PangolinLibrary.getAmountsOut(
-            pangolinFactory,
-            _amount,
-            path1
-        )[1];
-
-        IERC20(WAVAX).approve(address(pangolinRouter), _amount);
-        uint256 amountReceived1 = pangolinRouter.swapExactTokensForTokens(
-            _amount,
-            amountRequired1,
-            path1,
-            address(this),
-            deadline
-        )[1];
-
-        console.log(
-            "amountExpect",
-            "amountReceived1",
-            amountRequired1,
-            amountReceived1
-        );
-
-        address[] memory path2 = new address[](2);
-        path2[0] = _token;
-        path2[1] = WAVAX;
-
-        // amount out
-        uint256 amountRequired2 = JoeLibrary.getAmountsOut(
-            joeFactory,
-            amountReceived1,
-            path2
-        )[1];
-
-        IERC20(_token).approve(address(joeRouter), amountReceived1);
-        uint256 terminalAmount = joeRouter.swapExactTokensForTokens(
-            amountReceived1,
-            amountRequired2,
-            path2,
-            address(this),
-            deadline
-        )[1];
-
-        console.log(
-            "amountExpected",
-            "amountReceived2",
-            amountRequired2,
+            amountExpected2,
             terminalAmount
         );
 
@@ -212,8 +189,8 @@ contract FlashSwap is FlashLoanSimpleReceiverBase, Ownable {
         console.log("balance", IERC20(_asset).balanceOf(address(this)));
 
         uint256 totalDebt = _amount + _premium;
-        console.log("total flashed amount", _amount, _premium);
-        console.log("total debt amount", totalDebt);
+        console.log("flashed amount", _amount, "premium", _premium);
+        console.log("total should return", totalDebt);
 
         //
         // Your logic goes here.
@@ -221,18 +198,25 @@ contract FlashSwap is FlashLoanSimpleReceiverBase, Ownable {
         // From Joe swap to token, From Png swap to wavax
         // Repay
         //
-        address tokenOnArb = abi.decode(_params, (address));
-        (uint256 joeQuote, uint256 pngQuote) = quotePrice(tokenOnArb);
+        (address tokenOnArb, address dexA, address dexB) = abi.decode(
+            _params,
+            (address, address, address)
+        );
+        (address fromDex, address toDex) = quotePrice(tokenOnArb, dexA, dexB);
 
-        if (joeQuote > pngQuote) {
-            console.log("Swapping from PNG to JOE");
-        } else {
-            console.log("Swapping from JOE to PNG");
-        }
+        console.log(
+            "Swapping from",
+            dexes[fromDex].name,
+            "to",
+            dexes[toDex].name
+        );
 
-        uint256 terminalAmount = joeQuote > pngQuote
-            ? pngToJoe(tokenOnArb, _amount)
-            : joeToPng(tokenOnArb, _amount);
+        uint256 terminalAmount = swapBetweenDex(
+            tokenOnArb,
+            _amount,
+            fromDex,
+            toDex
+        );
 
         if (totalDebt > terminalAmount) {
             console.log("difference", totalDebt - terminalAmount);
@@ -240,17 +224,19 @@ contract FlashSwap is FlashLoanSimpleReceiverBase, Ownable {
             console.log("Profit", terminalAmount - totalDebt);
         }
 
-        IERC20(_asset).approve(address(POOL), totalDebt);
-        console.log("approved");
+        require(totalDebt <= terminalAmount, "Insufficiant Balance");
 
+        IERC20(_asset).approve(address(POOL), totalDebt);
         return true;
     }
 
-    function arbitrage(uint256 _amount, address _tokenOnArb)
-        external
-        onlyOwner
-    {
-        bytes memory param = abi.encode(_tokenOnArb);
+    function arbitrage(
+        uint256 _amount,
+        address _tokenOnArb,
+        address _dexA,
+        address _dexB
+    ) external onlyOwner {
+        bytes memory param = abi.encode(_tokenOnArb, _dexA, _dexB);
 
         // get the correct pool from pool addresses provider
         // and perform flashloan

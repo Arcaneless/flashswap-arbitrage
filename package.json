@@ -36,7 +36,7 @@
   },
   "scripts": {
     "start": "ts-node src/index.ts",
-    "fb": "npx hardhat run scripts/flash-arbs/index.ts --network hardhat",
+    "fb": "npx hardhat run scripts/flash-arbs/index.ts --network mainnet",
     "test": "npx hardhat test --network hardhat"
   },
   "dependencies": {

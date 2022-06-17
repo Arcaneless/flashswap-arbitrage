@@ -37,30 +37,26 @@ const findOptimalAVAX = (
   r1: BigNumber,
   r2: BigNumber,
   r3: BigNumber,
-  k0: BigNumber,
-  k1: BigNumber
+  fee = ethers.BigNumber.from(997), // 1000 * (1-0.3%)
+  flashLoanFee = ethers.BigNumber.from(5) // 10000 * (0.09%)
 ) => {
-  const a = r1.add(r2);
-  const b = r3
-    .mul(r2)
-    .add(r3.mul(r2))
-    .add(r2.mul(r0))
-    .add(r1.mul(r0))
-    .add(k1)
-    .mul(-1);
-  const c = r3
-    .mul(r2)
-    .mul(r0)
-    .add(r3.mul(r1).mul(r0))
-    .sub(r3.mul(k0))
-    .sub(k1.mul(r0));
+  // multiplied fee by this number to avoid decimals
+  const feeMultiplier = ethers.BigNumber.from(1000);
+  const flashLoanFeeMultiplier = ethers.BigNumber.from(10000);
 
-  const x = b
-    .mul(-1)
-    .add(sqrt(b.pow(2).sub(a.mul(c).mul(4))))
-    .div(a.mul(2));
-
-  return x;
+  const a = sqrt(
+    r0
+      .mul(r1)
+      .mul(r2)
+      .mul(r3)
+      .mul(fee.pow(2))
+      .div(feeMultiplier.pow(2))
+      .div(flashLoanFee.add(flashLoanFeeMultiplier))
+      .mul(flashLoanFeeMultiplier)
+  );
+  const b = r0.mul(r2);
+  const c = fee.pow(2).mul(r1).div(feeMultiplier).add(fee.mul(r2));
+  return a.sub(b).div(c).mul(feeMultiplier);
 };
 
 async function main() {
@@ -117,41 +113,26 @@ async function main() {
 
     const joePtpPrice = await joeRouter.getAmountsOut(
       ethers.utils.parseEther("1"),
-      [WAVAX, PTP]
+      [PTP, WAVAX]
     );
     const pngPtpPrice: BigNumber[] = await pangolinRouter.getAmountsOut(
       ethers.utils.parseEther("1"),
-      [WAVAX, PTP]
+      [PTP, WAVAX]
     );
 
     let direction = "none";
     let optimalValue = "";
-    if (joePtpPrice[1].gt(pngPtpPrice[1])) {
+    let newPriceJoe = "";
+    let newPricePng = "";
+    if (pngPtpPrice[1].gt(joePtpPrice[1])) {
       // route: WAVAX -> JOE PTP -> PNG PTP -> WAVAX
-      // x WAVAX -> r1 - k0 / (r0 + x) PTP -> r3 - k1 / (r2 + (r1 - k / (r0 + x)))
-      // (r1 - k0 / (r0 + x)) / x = (r1 - k0 / (r0 + x)) / (r3 - k1 / (r2 + (r1 - k / (r0 + x))))
-      // x = (r3 - k1 / (r2 + (r1 - k / (r0 + x))))
-      const x = findOptimalAVAX(
-        reserve0,
-        reserve1,
-        reserve2,
-        reserve3,
-        kLastJoe,
-        kLastPng
-      );
+      const x = findOptimalAVAX(reserve1, reserve0, reserve2, reserve3);
 
       direction = "joe -> png";
       optimalValue = ethers.utils.formatEther(x);
-    } else if (pngPtpPrice[1].gt(joePtpPrice[1])) {
+    } else if (joePtpPrice[1].gt(pngPtpPrice[1])) {
       // route: WAVAX -> PNG PTP -> JOE PTP -> WAVAX
-      const x = findOptimalAVAX(
-        reserve2,
-        reserve3,
-        reserve0,
-        reserve1,
-        kLastPng,
-        kLastJoe
-      );
+      const x = findOptimalAVAX(reserve3, reserve2, reserve0, reserve1);
 
       direction = "png -> joe";
       optimalValue = ethers.utils.formatEther(x);
@@ -173,7 +154,7 @@ async function main() {
       table.shift();
     }
     // monitor contract
-    console.clear();
+    // console.clear();
     console.table(table);
 
     const gasCost = await calculateGasCost();
